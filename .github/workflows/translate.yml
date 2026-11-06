@@ -1,0 +1,186 @@
+name: Translate Book
+
+# 手动触发的翻译流水线：在 Actions 页面点 Run workflow，填一本书的直链，
+# 云端机器跑完后把双语版本作为 artifact 下载。
+on:
+  workflow_dispatch:
+    inputs:
+      book_url:
+        description: '书籍直链（epub / txt / md / srt），必须能直接下载'
+        required: true
+        type: string
+      language:
+        description: '目标语言（zh-hans / zh-hant / ja / ko / en ...）'
+        required: false
+        default: 'zh-hans'
+        type: string
+      api_format:
+        description: '翻译接口。google 免费无需 key；其余需要配 BBM_API_KEY'
+        required: false
+        default: 'google'
+        type: choice
+        options:
+          - google
+          - openai
+          - anthropic
+          - gemini
+          - qwen
+          - groq
+          - xai
+          - litellm
+          - deeplfree
+          - deepl
+          - caiyun
+          - tencent
+          - codex
+      model:
+        description: '模型名（仅 AI 接口需要，如 gpt-4o-mini / gemini-2.5-flash）'
+        required: false
+        default: ''
+        type: string
+      api_base:
+        description: '自定义 API 地址（OpenAI 兼容中转站，以 /v1 结尾；留空用官方）'
+        required: false
+        default: ''
+        type: string
+      test_num:
+        description: '只翻开头 N 段做试译；填 0 表示翻完整本书'
+        required: false
+        default: '0'
+        type: string
+      translate_tags:
+        description: '只翻这些标签内的内容，如 div,p（留空自动判断）'
+        required: false
+        default: ''
+        type: string
+      use_context:
+        description: '会话模式：保持全书人名术语一致，更耗 token'
+        required: false
+        default: false
+        type: boolean
+
+# 同一时间只跑一个，避免重复点按钮把额度烧掉
+concurrency:
+  group: translate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    # 整本书翻译可能很久，给足上限
+    timeout-minutes: 350
+
+    env:
+      # 在仓库 Settings → Secrets and variables → Actions 里添加。
+      # 用 google 接口时可完全不配。
+      BBM_API_KEY: ${{ secrets.BBM_API_KEY }}
+      # 让 tiktoken 等组件的下载走同一条链路
+      PIP_NO_INPUT: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          bbook_maker --help > /dev/null && echo "CLI ready"
+
+      - name: Download the book
+        id: fetch
+        run: |
+          set -euo pipefail
+          export BOOK_URL="${{ inputs.book_url }}"
+
+          # 用 URL 的 path 段推文件名：解掉 %20 之类转义，去掉 ?query#frag
+          name="$(python3 - <<'PY'
+          import os, urllib.parse
+          path = urllib.parse.urlparse(os.environ["BOOK_URL"]).path
+          name = os.path.basename(urllib.parse.unquote(path)).strip() or "book.epub"
+          # 只接受这四种，其余一律按 epub 处理
+          if not name.lower().endswith((".epub", ".txt", ".md", ".srt")):
+              name = os.path.splitext(name)[0] + ".epub"
+          # 清掉路径分隔符，避免写到 books/ 之外
+          print(name.replace("/", "_").replace("\\", "_"))
+          PY
+          )"
+
+          echo "saving as: $name"
+          mkdir -p books
+          curl -fL --retry 3 --retry-delay 5 \
+               -A 'Mozilla/5.0' \
+               -o "books/$name" "$BOOK_URL"
+
+          size=$(stat -c %s "books/$name")
+          echo "downloaded $size bytes"
+          # 小于 1KB 基本可以断定下到的是错误页
+          if [ "$size" -lt 1024 ]; then
+            echo "::error::下载到的文件只有 $size 字节，多半是错误页而不是书"
+            head -c 300 "books/$name" || true
+            exit 1
+          fi
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Translate
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.fetch.outputs.name }}"
+          FORMAT="${{ inputs.api_format }}"
+          LANG_="${{ inputs.language }}"
+
+          ARGS=(--book_name "books/$NAME" --api_format "$FORMAT" --language "$LANG_")
+
+          if [ -n "${{ inputs.model }}" ]; then
+            ARGS+=(--model "${{ inputs.model }}")
+          fi
+          if [ -n "${{ inputs.api_base }}" ]; then
+            ARGS+=(--api_base "${{ inputs.api_base }}")
+          fi
+          if [ -n "${{ inputs.translate_tags }}" ]; then
+            ARGS+=(--translate_tags "${{ inputs.translate_tags }}")
+          fi
+          if [ "${{ inputs.use_context }}" = "true" ]; then
+            ARGS+=(--use_context session)
+          fi
+          # test_num 为 0 或空 = 整本书
+          if [ -n "${{ inputs.test_num }}" ] && [ "${{ inputs.test_num }}" != "0" ]; then
+            ARGS+=(--test --test_num "${{ inputs.test_num }}")
+          fi
+
+          # 除了 google/deeplfree 之外都要 key
+          case "$FORMAT" in
+            google|deeplfree) ;;
+            *)
+              if [ -z "${BBM_API_KEY:-}" ]; then
+                echo "::error::$FORMAT 接口需要 key，请先在仓库 Secrets 里加 BBM_API_KEY"
+                exit 1
+              fi
+              ARGS+=(--key "$BBM_API_KEY")
+              ;;
+          esac
+
+          echo "format=$FORMAT  language=$LANG_  model=${{ inputs.model }}  book=books/$NAME"
+          bbook_maker "${ARGS[@]}"
+
+      - name: Show result
+        if: always()
+        run: |
+          echo "=== 产物 ==="
+          ls -lh books/ || true
+
+      - name: Upload bilingual book
+        uses: actions/upload-artifact@v4
+        with:
+          name: bilingual-${{ inputs.language }}-${{ github.run_number }}
+          path: |
+            books/*_bilingual.*
+          if-no-files-found: error
+          retention-days: 30
